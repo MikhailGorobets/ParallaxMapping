@@ -1,0 +1,129 @@
+﻿
+static const float M_PI = 3.14159265f;
+static const float M_EPSILON = 1.0e-3f;
+
+static const float FLT_EPSILON = 1.192092896e-07f;
+static const float FLT_MAX = 3.402823466e+38f;
+static const float FLT_MIN = 1.175494351e-38f;
+
+matrix ViewProjMatrix;
+matrix ViewMatrix;
+matrix WorldMatrix;
+matrix NormalMatrix;
+
+matrix InvViewProjMatrix;
+matrix InvViewMatrix;
+matrix InvWorldMatrix;
+matrix InvNormalMatrix;
+
+int    StepCount;
+int    FrequencyU;
+int    FrequencyV;
+float  NormalFactor;
+float  Threshold;
+
+float3 MaterialAlbedo;
+float  MaterialRoughness;
+float  MaterialMetalness;
+
+float3 BoundingBoxMin;
+float3 BoundingBoxMax;
+float2 RenderTargetDim;
+
+float3 PointLightPosition;
+float3 PointLightColor;
+float  PointLightIntensity;
+float  PointLightRange;
+
+struct Ray {
+    float3 Origin;
+    float3 Direction;
+    float Min;
+    float Max;
+};
+
+struct Intersection {
+    float Near;
+    float Far;
+    bool  IsValid;
+};
+
+struct AABB {
+    float3 Min;
+    float3 Max;
+};
+
+struct ScatterEvent {
+    float3 Position;
+    float3 Normal;
+    float3 View;
+    float3 Diffuse;
+    float3 Specular;
+    float  Roughness;
+    float  Alpha;
+    bool   IsValid;
+};
+
+Ray CreateCameraRay(float4x4 invViewProj, uint2 id, float2 dimension) {
+    float2 ncdXY = 2.0f * id.xy / dimension - 1.0f;
+	
+    float4 rayStart = mul(invViewProj, float4(ncdXY, -1.0f, 1.0f));
+    float4 rayEnd   = mul(invViewProj, float4(ncdXY, +1.0f, 1.0f));
+
+    rayStart.xyz /= rayStart.w;
+    rayEnd.xyz   /= rayEnd.w;
+
+    Ray ray;
+    ray.Direction = normalize(rayEnd.xyz - rayStart.xyz);
+    ray.Origin = rayStart.xyz;
+    ray.Min = 0;
+    ray.Max = length(rayEnd.xyz - rayStart.xyz);;
+
+    return ray;
+}
+
+Intersection IntersectAABB(Ray ray, AABB aabb) {
+    Intersection intersect;
+    intersect.IsValid = false;
+    intersect.Near = 0.0f;
+    intersect.Far = FLT_MAX;
+
+    const float3 invR = rcp(ray.Direction);
+    const float3 bot = invR * (aabb.Min - ray.Origin);
+    const float3 top = invR * (aabb.Max - ray.Origin);
+    const float3 tmin = min(top, bot);
+    const float3 tmax = max(top, bot);
+
+    const float largestMin = max(max(tmin.x, tmin.y), tmin.z);
+    const float largestMax = min(min(tmax.x, tmax.y), tmax.z);
+
+
+    intersect.IsValid = (largestMax > largestMin);
+    intersect.Near = largestMin;
+    intersect.Far = largestMax;
+	
+    return intersect;
+}
+
+float3 FresnelSchlick(float3 F0, float3 F90, float VdotH) {
+    return F0 + (F90 - F0) * pow(1.0 - VdotH, 5.0);
+}
+
+float GGX_PartialGeometry(float NdotX, float alpha) {
+    const float aa = alpha * alpha;
+    return 2.0 * NdotX / max((NdotX + sqrt(aa + (1.0 - aa) * (NdotX * NdotX))), FLT_EPSILON);
+}
+
+float GGX_Distribution(float NdotH, float alpha) {
+    const float aa = alpha * alpha;
+    const float f = (NdotH * aa - NdotH) * NdotH + 1.0;
+    return aa / (M_PI * f * f);
+}
+
+float3 GetNormalizedTexcoord(float3 position, AABB aabb) {
+    return saturate((position - aabb.Min) / (aabb.Max - aabb.Min));
+}
+
+float3 GetPosition(float3 texcoord, AABB aabb) {
+    return texcoord * (aabb.Max - aabb.Min) + aabb.Min;
+}

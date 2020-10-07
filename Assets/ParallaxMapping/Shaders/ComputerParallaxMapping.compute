@@ -1,0 +1,177 @@
+﻿#pragma kernel ParallaxMapping
+
+#include "Common.compute"
+
+Texture2D<float>  TextureHeightMap;
+Texture2D<float3> TextureDiffuseMap;
+Texture2D<float3> TextureEnvironmentMap;
+
+RWTexture2D<float3> TextureColorUAV;
+
+SamplerState linear_repeat_sampler;
+SamplerState point_repeat_sampler;
+SamplerState point_clamp_sampler;
+
+float3 GetNormal(float2 texcoord) {
+    int2 dimension;
+    TextureHeightMap.GetDimensions(dimension.x, dimension.y);
+    
+    const float2 dt = float2(1.0 / dimension.x, 1.0 / dimension.y);
+      
+    float dx = (
+        -1.0f * TextureHeightMap.SampleLevel(linear_repeat_sampler, texcoord + float2(-dt.x, -dt.y), 0) +
+        -2.0f * TextureHeightMap.SampleLevel(linear_repeat_sampler, texcoord + float2(-dt.x, +0.0f), 0) +
+        -1.0f * TextureHeightMap.SampleLevel(linear_repeat_sampler, texcoord + float2(-dt.x, +dt.y), 0) +
+        +1.0f * TextureHeightMap.SampleLevel(linear_repeat_sampler, texcoord + float2(+dt.x, -dt.y), 0) +
+        +2.0f * TextureHeightMap.SampleLevel(linear_repeat_sampler, texcoord + float2(+dt.x, +0.0f), 0) +
+        +1.0f * TextureHeightMap.SampleLevel(linear_repeat_sampler, texcoord + float2(+dt.x, +dt.y), 0));
+       
+    float dy = (
+        -1.0f * TextureHeightMap.SampleLevel(linear_repeat_sampler, texcoord + float2(-dt.x, -dt.y), 0) +
+        -2.0f * TextureHeightMap.SampleLevel(linear_repeat_sampler, texcoord + float2(+0.0f, -dt.y), 0) +
+        -1.0f * TextureHeightMap.SampleLevel(linear_repeat_sampler, texcoord + float2(+dt.x, -dt.y), 0) +
+        +1.0f * TextureHeightMap.SampleLevel(linear_repeat_sampler, texcoord + float2(-dt.x, +dt.y), 0) +
+        +2.0f * TextureHeightMap.SampleLevel(linear_repeat_sampler, texcoord + float2(+0.0f, +dt.y), 0) +
+        +1.0f * TextureHeightMap.SampleLevel(linear_repeat_sampler, texcoord + float2(+dt.x, +dt.y), 0));
+   
+    return normalize(float3(-NormalFactor * dx, -NormalFactor * dy, 1));
+}
+
+float3 GetDiffuse(float2 texcoord) {
+    return MaterialAlbedo * (1.0 - MaterialMetalness) / M_PI;
+}
+
+float3 GetSpecular(float2 texcoord) {
+    return lerp(float3(0.04, 0.04, 0.04), MaterialAlbedo, MaterialMetalness);
+}
+
+float GetRoughness(float2 texcoord) {
+    return MaterialRoughness;
+}
+
+ScatterEvent RayMarching(Ray ray, AABB aabb) {
+    ScatterEvent event;
+    event.IsValid = false;
+    event.Normal = float3(0.0f, 0.0f, 0.0f);
+    event.Position = float3(0.0f, 0.0f, 0.0f);
+    event.View = float3(0.0f, 0.0f, 0.0f);
+    event.Diffuse = float3(0.0f, 0.0f, 0.0f);
+    event.Specular = float3(0.0f, 0.0f, 0.0f);
+    event.Roughness = 0.0f;
+    event.Alpha = 0.0f;
+    
+    Intersection intersect = IntersectAABB(ray, aabb);
+    
+    if (!intersect.IsValid)
+        return event;
+    
+    const float minT = max(intersect.Near, ray.Min);
+    const float maxT = min(intersect.Far, ray.Max);
+          
+    float3 t0 = GetNormalizedTexcoord(ray.Origin + minT * ray.Direction, aabb);
+    float3 t1 = GetNormalizedTexcoord(ray.Origin + maxT * ray.Direction, aabb);
+    
+    const float3 dG = (t1 - t0) / StepCount;
+    
+    // Step Count = lerp(minStep, maxStep, 1 - abs(dot(N, V)))  
+    // This could be improved by binary search, precompure quad-tree or sdf
+    for (int index = 0; index < StepCount; index++) {
+        float3 texcoord = t0 + index * dG;
+        float3 texcoordFreq = frac(float3(FrequencyU, FrequencyV, 1.0) * texcoord);
+    
+        if (distance(texcoord.z, TextureHeightMap.SampleLevel(linear_repeat_sampler, texcoordFreq.xy, 0)) < Threshold) {
+            event.IsValid = true;
+            event.View = -ray.Direction;
+            event.Position = GetPosition(texcoord, aabb);
+            event.Normal = GetNormal(texcoordFreq.xy);
+            event.Diffuse = GetDiffuse(texcoordFreq.xy);
+            event.Specular = GetSpecular(texcoordFreq.xy);
+            event.Roughness = GetRoughness(texcoordFreq.xy);
+            event.Alpha = event.Roughness * event.Roughness;
+            break;
+        }
+    }
+
+    return event;
+}
+
+float RayMarchingShadow(Ray ray, AABB aabb) {    
+    float shadowMultiplayer = 0.0f;
+    
+    if (dot(ray.Direction, float3(0.0, 0.0, 1.0)) > 0.0) {
+    
+        Intersection intersect = IntersectAABB(ray, aabb);    
+
+        const float minT = max(intersect.Near, ray.Min);
+        const float maxT = min(intersect.Far, ray.Max);
+              
+        float3 t0 = GetNormalizedTexcoord(ray.Origin + minT * ray.Direction, aabb);
+        float3 t1 = GetNormalizedTexcoord(ray.Origin + maxT * ray.Direction, aabb);
+    
+        const float3 dG = (t1 - t0) / StepCount;
+ 
+        for (int index = 0; index < StepCount; index++) {
+            float3 texcoord = t0 + index * dG;
+            float3 texcoordFreq = frac(float3(FrequencyU, FrequencyV, 1.0) * texcoord);
+       
+            float h = TextureHeightMap.SampleLevel(linear_repeat_sampler, texcoordFreq.xy, 0);
+        
+            if (texcoord.z < h) {
+                float psf = distance(aabb.Min, aabb.Max) * distance(texcoord.z, h) * (1.0 - index / StepCount);
+                shadowMultiplayer = max(shadowMultiplayer, psf);            
+            }
+        }
+    }
+    
+    return 1.0 - shadowMultiplayer;
+}
+
+[numthreads(8, 8, 1)]
+void ParallaxMapping (uint3 id : SV_DispatchThreadID) {   
+    Ray ray = CreateCameraRay(InvViewProjMatrix, id.xy, RenderTargetDim);
+    AABB aabb = { BoundingBoxMin, BoundingBoxMax };
+    
+    float3 radiance  = { 0.0f, 0.0f, 0.0f };
+    float3 throughput = { 1.0f, 1.0f, 1.0f };
+    float3 lightPosition = mul(InvWorldMatrix, float4(PointLightPosition, 1.0)).xyz; //Light Position from World space -> Local space   
+     
+   //Ray from World space -> Local space       
+    ray.Origin = mul(InvWorldMatrix, float4(ray.Origin, 1.0)).xyz;
+    ray.Direction = mul((float3x3) InvNormalMatrix, ray.Direction);
+    ScatterEvent event = RayMarching(ray, aabb);
+
+    if (event.IsValid) {
+
+        float magnitude = distance(lightPosition, event.Position);
+        float attenuation = (1.0 / (magnitude * magnitude));
+    
+        float3 N = event.Normal;
+        float3 V = event.View;
+        float3 L = normalize(lightPosition - event.Position);
+        float3 H = normalize(V + L);   
+    
+        float NdotL = clamp(dot(N, L), 0.001, 1.0);
+        float NdotV = clamp(abs(dot(N, V)), 0.001, 1.0);
+        float NdotH = clamp(dot(N, H), 0.0, 1.0);
+        float LdotH = clamp(dot(L, H), 0.0, 1.0);
+        float VdotH = clamp(dot(V, H), 0.0, 1.0);
+       
+        float3 F = FresnelSchlick(event.Specular, 1.0, VdotH);
+        float G = GGX_PartialGeometry(NdotV, event.Alpha) * GGX_PartialGeometry(NdotL, event.Alpha);
+        float D = GGX_Distribution(NdotH, event.Alpha);
+     
+        float3 diffuse = (1.0 - F) * event.Diffuse;
+        float3 specular = F * G * D / (4.0 * NdotL * NdotV);
+    
+        throughput *= NdotL * attenuation * PointLightIntensity * PointLightColor * (diffuse + specular);
+    
+        ray.Origin = event.Position;
+        ray.Direction = L;
+     
+        throughput *= RayMarchingShadow(ray, aabb);
+   
+        radiance += throughput;
+    }
+        
+    TextureColorUAV[id.xy] = radiance;
+}
